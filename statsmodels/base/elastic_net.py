@@ -262,6 +262,213 @@ def fit_elasticnet(model, method="coord_descent", maxiter=100,
 
     return refit
 
+def fit_elasticnet_constrained(model, method="coord_descent", maxiter=100,
+                   alpha=0., L1_wt=1., start_params=None, cnvrg_tol=1e-7,
+                   zero_tol=1e-8, refit=False, check_step=True,
+                   loglike_kwds=None, score_kwds=None, hess_kwds=None, x_limits = None):
+    """
+    Return an elastic net regularized fit to a regression model.
+
+    Parameters
+    ----------
+    model : model object
+        A statsmodels object implementing ``loglike``, ``score``, and
+        ``hessian``.
+    method :
+        Only the coordinate descent algorithm is implemented.
+    maxiter : integer
+        The maximum number of iteration cycles (an iteration cycle
+        involves running coordinate descent on all variables).
+    alpha : scalar or array-like
+        The penalty weight.  If a scalar, the same penalty weight
+        applies to all variables in the model.  If a vector, it
+        must have the same length as `params`, and contains a
+        penalty weight for each coefficient.
+    L1_wt : scalar
+        The fraction of the penalty given to the L1 penalty term.
+        Must be between 0 and 1 (inclusive).  If 0, the fit is
+        a ridge fit, if 1 it is a lasso fit.
+    start_params : array-like
+        Starting values for `params`.
+    cnvrg_tol : scalar
+        If `params` changes by less than this amount (in sup-norm)
+        in one iteration cycle, the algorithm terminates with
+        convergence.
+    zero_tol : scalar
+        Any estimated coefficient smaller than this value is
+        replaced with zero.
+    refit : bool
+        If True, the model is refit using only the variables that have
+        non-zero coefficients in the regularized fit.  The refitted
+        model is not regularized.
+    check_step : bool
+        If True, confirm that the first step is an improvement and search
+        further if it is not.
+    loglike_kwds : dict-like or None
+        Keyword arguments for the log-likelihood function.
+    score_kwds : dict-like or None
+        Keyword arguments for the score function.
+    hess_kwds : dict-like or None
+        Keyword arguments for the Hessian function.
+
+    Returns
+    -------
+    A results object.
+
+    Notes
+    -----
+    The ``elastic net`` penalty is a combination of L1 and L2
+    penalties.
+
+    The function that is minimized is:
+
+    -loglike/n + alpha*((1-L1_wt)*|params|_2^2/2 + L1_wt*|params|_1)
+
+    where |*|_1 and |*|_2 are the L1 and L2 norms.
+
+    The computational approach used here is to obtain a quadratic
+    approximation to the smooth part of the target function:
+
+    -loglike/n + alpha*(1-L1_wt)*|params|_2^2/2
+
+    then repeatedly optimize the L1 penalized version of this function
+    along coordinate axes.
+    """
+
+    k_exog = model.exog.shape[1]
+
+    loglike_kwds = {} if loglike_kwds is None else loglike_kwds
+    score_kwds = {} if score_kwds is None else score_kwds
+    hess_kwds = {} if hess_kwds is None else hess_kwds
+
+    if np.isscalar(alpha):
+        alpha = alpha * np.ones(k_exog)
+
+    # Define starting params
+    if start_params is None:
+        params = np.zeros(k_exog)
+    else:
+        params = start_params.copy()
+
+    btol = 1e-4
+    params_zero = np.zeros(len(params), dtype=bool)
+
+    init_args = model._get_init_kwds()
+    # we don't need a copy of init_args because get_init_kwds provides new dict
+    init_args['hasconst'] = False
+    model_offset = init_args.pop('offset', None)
+    if 'exposure' in init_args and init_args['exposure'] is not None:
+        if model_offset is None:
+            model_offset = np.log(init_args.pop('exposure'))
+        else:
+            model_offset += np.log(init_args.pop('exposure'))
+
+    fgh_list = [
+        _gen_npfuncs(k, L1_wt, alpha, loglike_kwds, score_kwds, hess_kwds)
+        for k in range(k_exog)]
+
+    for itr in range(maxiter):
+
+        # Sweep through the parameters
+        params_save = params.copy()
+        for k in range(k_exog):
+
+            # Under the active set method, if a parameter becomes
+            # zero we don't try to change it again.
+            # TODO : give the user the option to switch this off
+            if params_zero[k]:
+                continue
+
+            # Set the offset to account for the variables that are
+            # being held fixed in the current coordinate
+            # optimization.
+            params0 = params.copy()
+            params0[k] = 0
+            offset = np.dot(model.exog, params0)
+            if model_offset is not None:
+                offset += model_offset
+
+            # Create a one-variable model for optimization.
+            model_1var = model.__class__(
+                model.endog, model.exog[:, k], offset=offset, **init_args)
+
+            # Do the one-dimensional optimization.
+            func, grad, hess = fgh_list[k]
+            params[k] = _opt_1d(
+                func, grad, hess, model_1var, params[k], alpha[k]*L1_wt,
+                tol=btol, check_step=check_step)
+
+            # set the parameter to be within the limits
+            if not x_limits is None:
+                # print 'LIMITING PARAMETER', k
+                params[k] = max(x_limits[k][0], min(x_limits[k][1], params[k]))
+
+            # Update the active set
+            if itr > 0 and np.abs(params[k]) < zero_tol:
+                params_zero[k] = True
+                params[k] = 0.
+
+        # Check for convergence
+        pchange = np.max(np.abs(params - params_save))
+        if pchange < cnvrg_tol:
+            break
+
+    # Set approximate zero coefficients to be exactly zero
+    params[np.abs(params) < zero_tol] = 0
+
+    if not refit:
+        results = RegularizedResults(model, params)
+        return RegularizedResultsWrapper(results)
+
+    # Fit the reduced model to get standard errors and other
+    # post-estimation results.
+    ii = np.flatnonzero(params)
+    cov = np.zeros((k_exog, k_exog))
+    init_args = dict([(k, getattr(model, k, None)) for k in model._init_keys])
+    if len(ii) > 0:
+        model1 = model.__class__(
+            model.endog, model.exog[:, ii], **init_args)
+        rslt = model1.fit()
+        params[ii] = rslt.params
+        cov[np.ix_(ii, ii)] = rslt.normalized_cov_params
+    else:
+        # Hack: no variables were selected but we need to run fit in
+        # order to get the correct results class.  So just fit a model
+        # with one variable.
+        model1 = model.__class__(model.endog, model.exog[:, 0], **init_args)
+        rslt = model1.fit(maxiter=0)
+
+    # fit may return a results or a results wrapper
+    if issubclass(rslt.__class__, wrap.ResultsWrapper):
+        klass = rslt._results.__class__
+    else:
+        klass = rslt.__class__
+
+    # Not all models have a scale
+    if hasattr(rslt, 'scale'):
+        scale = rslt.scale
+    else:
+        scale = 1.
+
+    # The degrees of freedom should reflect the number of parameters
+    # in the refit model, not including the zeros that are displayed
+    # to indicate which variables were dropped.  See issue #1723 for
+    # discussion about setting df parameters in model and results
+    # classes.
+    p, q = model.df_model, model.df_resid
+    model.df_model = len(ii)
+    model.df_resid = model.nobs - model.df_model
+
+    # Assuming a standard signature for creating results classes.
+    refit = klass(model, params, cov, scale=scale)
+    refit.regularized = True
+    refit.method = method
+    refit.fit_history = {'iteration': itr + 1}
+
+    # Restore df in model class, see issue #1723 for discussion.
+    model.df_model, model.df_resid = p, q
+
+    return refit
 
 def _opt_1d(func, grad, hess, model, start, L1_wt, tol,
             check_step=True):
